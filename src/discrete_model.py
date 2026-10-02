@@ -4,8 +4,10 @@ from abc import abstractmethod
 from dataclasses import dataclass, field
 from typing import override
 
+import networkx as nx
 import numpy as np
 import numpy.typing as npt
+from scipy import sparse
 
 from constants import NEG_INF
 from cost_function import CostFunction
@@ -431,9 +433,11 @@ class MRFModel(DiscreteStateModel):
     warm_iter: int = field(default=50)
 
     _neighbours: dict[Edge, dict[Edge, HopDistance]] = field(init=False)
-    _log_prior: dict[Edge, LogStateWeights] = field(init=False)
-    _mu: dict[Edge, float] = field(init=False)
-    _beta: list[float] = field(init=False)
+    _log_prior: npt.NDArray[np.float64] = field(init=False)
+    _mu: npt.NDArray[np.float64] = field(init=False)
+    _index: dict[Edge, int] = field(init=False)
+    _coupling: sparse.csr_array = field(init=False)
+    _colour_classes: list[npt.NDArray[np.intp]] = field(init=False)
     _last_state: Scenario | None = field(init=False, default=None)
 
     def __post_init__(self) -> None:
@@ -449,9 +453,46 @@ class MRFModel(DiscreteStateModel):
             for u, row in self.distances.items()
         }
 
-        self._beta = [float(b) for b in self.beta]
-        self._log_prior = {e: self._field(e) for e in self._edges}
-        self._mu = {e: self._expected_state(e) for e in self._edges}
+        ## The sampler works on arrays indexed by the model's edge order.
+        self._index = {edge: i for i, edge in enumerate(self._edges)}
+        self._log_prior = np.array(
+            [
+                [self._field(edge)[s] for s in range(self._n_states)]
+                for edge in self._edges
+            ]
+        )
+        self._mu = np.array([self._expected_state(edge) for edge in self._edges])
+
+        ## Row e holds beta[d - 1] / |N(e)| for every neighbour at distance
+        ## d, so coupling @ (states - mu) is every edge's mean deviation.
+        rows: list[int] = []
+        cols: list[int] = []
+        vals: list[float] = []
+        for edge in self._edges:
+            neighbours = self._neighbours.get(edge, {})
+            for neighbour, dist in neighbours.items():
+                rows.append(self._index[edge])
+                cols.append(self._index[neighbour])
+                vals.append(float(self.beta[dist - 1]) / len(neighbours))
+        n_edges = len(self._edges)
+        self._coupling = sparse.csr_array(
+            (vals, (rows, cols)), shape=(n_edges, n_edges)
+        )
+
+        ## Edges of one colour share no coupling, so given the rest they are
+        ## independent and a whole colour can be resampled at once: a valid
+        ## Gibbs sweep, one vectorised step per colour.
+        conflicts = nx.Graph()
+        conflicts.add_nodes_from(range(n_edges))
+        conflicts.add_edges_from(zip(rows, cols, strict=True))
+        colouring = nx.greedy_color(conflicts, strategy="largest_first")
+        classes: dict[int, list[int]] = {}
+        for i, colour in colouring.items():
+            classes.setdefault(colour, []).append(i)
+        self._colour_classes = [
+            np.array(sorted(members), dtype=np.intp)
+            for _, members in sorted(classes.items())
+        ]
 
     def _field(self, edge: Edge) -> LogStateWeights:
         """Turn an edge's prior into a log-space external field.
@@ -483,39 +524,25 @@ class MRFModel(DiscreteStateModel):
         """
         return sum(s * p for s, p in self.prior_probs[edge].items())
 
-    def _deviation(self, edge: Edge, scenario: Scenario) -> float:
-        """Measure how far an edge's neighbourhood departs from baseline.
-
-        Positive when neighbours carry more damage than their priors
-        predict, negative when they carry less. Averaging over the
-        neighbourhood keeps the scale independent of the cutoff, so beta
-        does not need recalibrating when the cutoff changes.
-
-        Params:
-            edge: The edge whose neighbourhood is measured.
-            scenario: The current configuration of the whole network.
-
-        Returns:
-            The distance-weighted mean deviation of the neighbours.
-        """
-        neighbours = self._neighbours[edge]
-        if not neighbours:
-            return 0.0
-
-        return sum(
-            self._beta[dist - 1] * (scenario[neighbour] - self._mu[neighbour])
-            for neighbour, dist in neighbours.items()
-        ) / len(neighbours)
-
     def _run_gibbs(
         self, full_states: dict[Edge, State], lower_bounds: dict[Edge, float]
     ) -> tuple[Scenario, Beliefs]:
         """Run the Gibbs chain over all edges.
 
-        Observed edges are clamped and never resampled. The final
-        configuration is a draw from the joint distribution, so it keeps the
-        clustering that the coupling induces. The marginals describe each
-        edge on its own.
+        An edge's conditional is
+
+            log p(s | rest) = (log prior(s) + s * D) / T + log P(obs | s),
+
+        where D is the beta-weighted mean deviation of its neighbours from
+        their prior means: positive when they carry more damage than their
+        priors predict. Averaging over the neighbourhood keeps the scale
+        independent of the cutoff, so beta needs no recalibrating when the
+        cutoff changes.
+
+        Each sweep resamples one colour class at a time, vectorised. Observed
+        edges are clamped and never resampled. The final configuration is a
+        draw from the joint distribution, so it keeps the clustering that the
+        coupling induces. The marginals describe each edge on its own.
 
         On a cold run the chain starts from the priors and discards burn_in
         sweeps. On a warm run it resumes from the previous configuration,
@@ -531,97 +558,76 @@ class MRFModel(DiscreteStateModel):
             The final configuration, and the per-edge posterior
             distributions.
         """
-        fully_observed_edges = full_states
-        evidence = {
-            edge: {
-                s: self.state_log_likelihood(s, lower)
-                for s in range(self._n_states)
-            }
-            for edge, lower in lower_bounds.items()
-        }
-        if self._last_state is None:
+        n_edges, n_states = self._log_prior.shape
+        ## Seeded from the injected rng, so runs stay reproducible.
+        gen = np.random.default_rng(self.rng.getrandbits(64))
+        states = np.arange(n_states)
 
+        log_likelihood = np.zeros((n_edges, n_states))
+        for edge, lower in lower_bounds.items():
+            log_likelihood[self._index[edge]] = [
+                self.state_log_likelihood(s, lower) for s in range(n_states)
+            ]
+        clamped = np.zeros(n_edges, dtype=bool)
+        clamped_idx = np.array(
+            [self._index[edge] for edge in full_states], dtype=np.intp
+        )
+        clamped_val = np.array(list(full_states.values()), dtype=np.intp)
+        clamped[clamped_idx] = True
+
+        if self._last_state is None:
             iters = self.n_iter
             burn_in = self.burn_in
-            scenario: Scenario = {}
-            for edge in self._edges:
-                if edge in fully_observed_edges:
-                    scenario[edge] = fully_observed_edges[edge]
-                else:
-                    log_likelihood = evidence.get(edge)
-                    if log_likelihood is None:
-                        scenario[edge] = self.sample_from_probs(self.prior_probs[edge])
-                    else:
-                        scenario[edge] = self.sample_from_log_weights(
-                            LogStateWeights(
-                                {
-                                    s: self._log_prior[edge][s] + log_likelihood[s]
-                                    for s in range(self._n_states)
-                                    if log_likelihood[s] != NEG_INF
-                                }
-                            )
-                        )
+            ## Gumbel-max: argmax of log-weights plus Gumbel noise is a draw.
+            x = np.argmax(
+                self._log_prior
+                + log_likelihood
+                + gen.gumbel(size=(n_edges, n_states)),
+                axis=1,
+            )
         else:
             iters = self.warm_iter
             burn_in = 0
-            scenario = dict(self._last_state)
-            for edge, state in fully_observed_edges.items():
-                scenario[edge] = state
+            x = np.array([self._last_state[edge] for edge in self._edges])
+        x[clamped_idx] = clamped_val
 
-        state_counts: dict[Edge, dict[State, int]] = {
-            e: dict.fromkeys(range(self._n_states), 0) for e in self._edges
-        }
+        sweeps = [
+            (idx, self._coupling[idx])
+            for idx in (c[~clamped[c]] for c in self._colour_classes)
+            if idx.size
+        ]
+        centered = x - self._mu
+        counts = np.zeros((n_edges, n_states), dtype=np.int64)
+        rows = np.arange(n_edges)
         n_samples = 0
 
         for sweep in range(iters):
-            for edge in self._edges:
-                if edge in fully_observed_edges:
-                    continue
-
-                log_prior = self._log_prior[edge]
-                log_likelihood = evidence.get(edge)
-                deviation = self._deviation(edge, scenario)
-                candidates = (
-                    [c for c in range(self._n_states) if log_likelihood[c] != NEG_INF]
-                    if log_likelihood
-                    else range(self._n_states)
-                )
-
-                weights = LogStateWeights(
-                    {
-                        candidate: (log_prior[candidate] + candidate * deviation)
-                        / self.temperature
-                        + (log_likelihood[candidate] if log_likelihood else 0.0)
-                        for candidate in candidates
-                    }
-                )
-
-                scenario[edge] = self.sample_from_log_weights(weights)
+            for idx, coupling in sweeps:
+                deviation = coupling @ centered
+                logits = (
+                    self._log_prior[idx] + deviation[:, None] * states
+                ) / self.temperature + log_likelihood[idx]
+                x[idx] = np.argmax(logits + gen.gumbel(size=logits.shape), axis=1)
+                centered[idx] = x[idx] - self._mu[idx]
 
             if sweep >= burn_in:
-                for edge in self._edges:
-                    state_counts[edge][scenario[edge]] += 1
+                counts[rows, x] += 1
                 n_samples += 1
 
-        beliefs: Beliefs = {}
+        ## No counted sweep (iterations <= burn-in) falls back to the priors.
+        marginals = counts / n_samples if n_samples else np.exp(self._log_prior)
+        marginals[clamped_idx] = 0.0
+        marginals[clamped_idx, clamped_val] = 1.0
 
-        for edge in self._edges:
-            if edge in fully_observed_edges:
-                beliefs[edge] = StateDistribution(
-                    {
-                        s: 1.0 if s == fully_observed_edges[edge] else 0.0
-                        for s in range(self._n_states)
-                    }
-                )
-            elif n_samples > 0:
-                beliefs[edge] = StateDistribution(
-                    {
-                        s: state_counts[edge][s] / n_samples
-                        for s in range(self._n_states)
-                    }
-                )
-            else:
-                beliefs[edge] = StateDistribution(dict(self.prior_probs[edge]))
+        scenario: Scenario = {
+            edge: int(x[i]) for i, edge in enumerate(self._edges)
+        }
+        beliefs: Beliefs = {
+            edge: StateDistribution(
+                {s: float(marginals[i, s]) for s in range(n_states)}
+            )
+            for i, edge in enumerate(self._edges)
+        }
 
         self._last_state = dict(scenario)
         return scenario, beliefs

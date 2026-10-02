@@ -39,15 +39,25 @@ Held in an agent's `KnowledgeBase`, always as cost multipliers (`cost / c_e`):
 - Each agent has an id, source, target, speed, its own **twin** `DisasterModel`, a
   `KnowledgeBase`, per-edge **expected multipliers** (posterior means), and a **heuristic map**
   (one joint multiplier sample consistent with its observations).
-- Position is continuous along an edge: `(prev_node, next_node, offset)`.
-- Planning (replans only on new information): Dijkstra with expected edge cost `c_e · E[m_e]` (for a discrete model, `E[m_e] = Σ_s b_e(s) · m(e, s)`). When replanning
-  mid-edge, the agent compares continuing forward vs turning back to `prev_node`.
-- Communication: `Message(source, target = ALL | set of ids, payload)`; payloads are
-  `Update(edge, multiplier)` (share an observation) and `Heartbeat(sender)`.
+- Position: at a node, or on edge `(entry, far)` heading to one of its ends, `pos` time units
+  from `entry`. Per edge it remembers the furthest time reached from each end (`reach`).
+- Planning (replans only on new information): Dijkstra with estimated edge time
+  `c_e · m̂_e / speed`, where `m̂_e` is the exact value if known, else the posterior mean
+  (`RoutingCost.EXPECTED`, default) or the heuristic-map sample (`RoutingCost.SAMPLE`).
+  Mid-edge it compares going back (`pos + d(entry)`, known exactly) with going on
+  (`max(T̂_e − pos, 0) + d(far)`); ties keep the heading.
+- Replan triggers: received knowledge, an edge fully explored (far end reached or stretches
+  meet), an edge overdue (time spent > estimated time → new lower bound). At most one model
+  update per batch of news.
+- Communication: `Message(source, target = ALL | set of ids, payload)` through a pluggable
+  `Channel` (`BroadcastChannel`: lossless, next tick). Payloads: `FullKnowledge(edge,
+  multiplier)` (exact), `PartialKnowledge(edge, multiplier)` (lower bound; receivers keep the
+  max, since bounds from different agents may overlap) and `Heartbeat(sender)`.
 
 ## Goal
-All agents reach their targets (`Stelllar.run_stellar` loops until every
-`has_completed_goal`). Simulation clock with fixed `DELTA_TIME = 0.1`.
+Every agent reaches its target. `Stellar.run()` advances a fixed-tick clock
+(`delta_time = 0.1`) until all have arrived or `max_time`, and returns a `RunResult`
+(per-agent arrival time, replans, turnarounds, observations; makespan, total, mean).
 
 ## Decisions
 1. **Objective**: every agent wants to reach its own target and minimises its own travel time
@@ -56,18 +66,18 @@ All agents reach their targets (`Stelllar.run_stellar` loops until every
 2. **Communication**: global broadcast for now, but the message layer must stay pluggable
    (range-limited, delayed, lossy channels later). `Heartbeat` is only a liveness sanity
    check; it carries no information for the model.
-3. **Observation**: an edge's multiplier is observed **exactly** once the whole edge has been
-   traversed. While partway along it the agent only knows a **lower bound** (from the time
-   spent on it so far), which is a partial observation. An agent can enter the same edge from
-   **either end at different times** (go partway from u, turn back, later enter from v), so
-   partial progress is tracked per edge **per entry side**, and the lower bound is derived
-   from that history.
-4. **Replanning**: only when new information arrives (own observation or a received `Update`).
+3. **Observation**: damage is **uniform along an edge**. The agent does not know how far
+   along an edge it is, only how long it has spent there; it does **remember the points it
+   has visited**. An agent can enter the same edge from **either end at different times**
+   (go partway from u, turn back, later enter from v). Per edge, keep the longest time spent
+   from each end, `t_u` and `t_v` (repeat entries from the same end overlap, so take the max).
+   - **Partial** (stretches don't meet): they are disjoint pieces of a uniform edge, so
+     `m_e ≥ (t_u + t_v) · speed / c_e` — a lower bound.
+   - **Exact**: on reaching the far end, or on reaching a point already visited from the other
+     end (the stretches meet). Then the edge has been covered exactly once and
+     `m_e = (t_u + t_v) · speed / c_e`, with `t_v` the time until the meeting point.
+4. **Replanning**: only when new information arrives (own observation or received knowledge).
 5. **Twin models**: usually differ from the true model; model mismatch is a research question.
 6. **Routing**: expected costs by default; the cost source (expected multipliers vs the
    heuristic-map sample) is a parameter.
 7. **Costs** are time-based: traversal time of edge e is `c_e · m_e / speed`.
-
-## Open questions
-1. How partial progress from the two ends of an edge combines into one lower bound
-   (e.g. max of the two sides, or something else).

@@ -12,7 +12,7 @@ flowchart TD
     M -->|generate_disaster| R[Realised multipliers<br/>held by simulator]
     M -.->|same params, own instance| TW[Agent twin model]
     R -->|agent observes edges| KB[KnowledgeBase<br/>multipliers: full + lower bounds]
-    MSG[Messages: Update edge, multiplier / Heartbeat] --> KB
+    MSG[Channel: FullKnowledge / PartialKnowledge / Heartbeat] --> KB
     KB -->|update cumulative| TW
     TW -->|joint multiplier sample| HM[heuristic map]
     TW -->|expected multipliers| B[expected]
@@ -33,7 +33,7 @@ flowchart TD
   `stats.lognorm(s=1)` (upper half of lognormal(0, 1), median 1). A custom `rv_continuous` with only `_pdf` is slow (numeric cdf/ppf: ~4 s
   for the 40×40 cache); define `_cdf`/`_ppf` on it when possible.
 - **`disaster_model.py`** — `DisasterModel` (ABC, `slots=True`): the **only** interface
-  `Agent`/`Stelllar` use. Speaks cost multipliers: `generate_disaster() -> CostScenario`,
+  `Agent`/`Stellar` use. Speaks cost multipliers: `generate_disaster() -> CostScenario`,
   `update(kb) -> (CostScenario, ExpectedMultipliers)`, `expected_multiplier(edge)`, `sample()`.
   No notion of states, so a non-discrete model (e.g. Gaussian MRF) can implement it.
 - **`discrete_model.py`**
@@ -44,20 +44,33 @@ flowchart TD
     `severity(m)`), `state_log_likelihood(state, lower)`, `_sample_at_least(state, lower)`.
     Posterior scenario/beliefs → multipliers / mean multipliers. Subclasses implement
     `generate_states()`, `prior_run()`, `update_states(full, lower)`, `sample_states(full, lower)`.
-  - `MRFModel(DiscreteStateModel)`: precomputes neighbours within cutoff, log-priors, prior
-    means; `_run_gibbs` does cold start (`n_iter`, `burn_in`) or warm start from `_last_state`
+  - `MRFModel(DiscreteStateModel)`: precomputes neighbours within cutoff, log-priors and prior
+    means as arrays, a sparse coupling matrix (row e = `β[d-1]/|N(e)|` per neighbour, so
+    `coupling @ (x − μ)` gives every edge's mean deviation) and a greedy colouring of the
+    coupling graph. A sweep resamples one colour class at a time, vectorised with Gumbel-max
+    (edges of one colour are conditionally independent, so this is exact Gibbs); `_run_gibbs` does cold start (`n_iter`, `burn_in`) or warm start from `_last_state`
     (`warm_iter`, no burn-in). `_cold_run` serves `generate_states`, `prior_run` and
     chain-less `sample_states` without touching the update chain.
 - **`edges.py`** — `canonical(u, v)` and `canonical_line_graph(graph)`.
 - **`message.py`** — immutable, slotted message dataclasses; `ALL` sentinel is a `StrEnum` member.
-- **`scenario_generator.py`** — `Agent` and `Stelllar` simulator (incomplete; see `STATUS.md`).
+- **`channel.py`** — `Channel` protocol (`send`, `deliver`) and `BroadcastChannel` (lossless,
+  delivers at the next tick, resolves `ALL`/target sets, never back to the sender).
+- **`scenario_generator.py`**
+  - `Agent`: position `(entry, far, heading, pos)` or a node; `reach[edge][end]` memory. A tick
+    moves it event by event: reaching an end, the explored stretches meeting (exact
+    observation, `(reach_u + reach_v)·speed/c_e`) and going overdue (lower bound from the same
+    sum). New knowledge → one `twin_model.update(kb)` → reroute (Dijkstra on estimated
+    times; mid-edge back-vs-forward choice). Observations are queued as messages.
+  - `Stellar`: draws the truth (`generate_disaster`), gives each agent its true crossing times
+    (used only to detect reaching a point), and loops ticks: deliver → ingest/replan → step →
+    send. Returns `RunResult`.
 - **`main.py`** — demo/plotting only; not a library entry point.
 
 ## Invariants
 - Every `Edge` is canonical `(min(u, v), max(u, v))`. The model's edge set/ordering is
   `prior_probs.keys()`, built from `canonical_line_graph(graph).nodes`. `DiscreteStateModel`
   rejects non-canonical priors and unknown observed edges (`ValueError`); `Agent` and
-  `message.Update` canonicalise what they receive.
+  the knowledge payloads canonicalise what they receive.
 - `update()` must receive **all** observations so far; clamping only the newest lets old ones drift.
 - Observations are **multipliers**: full = exact, partial = lower bound. Base costs live only on
   the topology (`graph[u][v]["cost"]`); models never see them.
@@ -75,7 +88,8 @@ flowchart TD
   multipliers never fall below an observed lower bound. `generate_disaster` uses the raw cache.
 - Full observations are clamped (belief = one-hot); partial observations remove impossible
   states (`log_likelihood == NEG_INF`) from the candidate set.
-- All randomness is injected: `rng` drives state sampling (Gibbs), `multiplier_rng` drives
+- All randomness is injected: `rng` drives state sampling (Gibbs seeds a numpy Generator from
+  `rng.getrandbits(64)` per run), `multiplier_rng` drives
   multiplier draws (cache and lower-bound redraws). The cost function is deterministic.
 - Sampling only runs forward (state → severity → multiplier); observing only backward
   (multiplier → severity → state). Neither direction needs the other.
@@ -83,4 +97,7 @@ flowchart TD
 ## Performance notes
 - `DistanceMatrix` is computed with `single_source_shortest_path_length(..., cutoff=len(BETA))`
   — never all-pairs (quadratic in edge count).
-- One Gibbs sweep is O(|E| · avg neighbours · K). The 40×40 grid has 3120 edges.
+- One Gibbs sweep is O(|E| · avg neighbours · K), done as one numpy step per colour class.
+  On the 40×40 grid (3120 edges): cold run (1000 sweeps) ≈ 0.6 s, warm update ≈ 0.04 s; a
+  3-agent simulation ≈ 16 s. The pure-Python sweep it replaced was ~20× slower; its marginals
+  match the vectorised ones within Monte Carlo noise.

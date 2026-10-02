@@ -5,14 +5,14 @@ disaster. A disaster model damages edges (discrete damage states → cost multip
 agents, each holding its own "digital twin" belief model, travel source → target, observe
 edges, share observations by message, and replan.
 
-Status: disaster model is done; agent/simulator loop is incomplete. See `docs/STATUS.md`.
+Status: disaster model and agent/simulator loop work; experiments and baselines are next. See `docs/STATUS.md`.
 
 ## Run / lint
 - Python ≥ 3.14 (uses PEP 695 `type` aliases), managed with **uv**.
 - Imports are flat (`from typedefs import ...`), so **run from `src/`**:
-  `cd src && uv run python main.py` → writes `disaster_state_{k}.png` into `src/`.
+  `cd src && uv run python main.py` → writes `disaster_state_{k}.png` into `src/`, then runs and prints a small simulation.
 - Lint: `uv run ruff check src` (rules in `pyproject.toml`: E,F,I,UP,B,SIM,C4,RET,PTH,RUF).
-- No tests, type-checker config, or `.gitignore` yet.
+- No tests or type-checker config yet.
 
 ## Layout (`src/`)
 | File | Responsibility |
@@ -20,12 +20,13 @@ Status: disaster model is done; agent/simulator loop is incomplete. See `docs/ST
 | `typedefs.py` | All shared type aliases (`Node`, `Edge`, `State`, `Scenario`, `Beliefs`, `KnowledgeBase`, ...) |
 | `constants.py` | `NEG_INF` |
 | `cost_function.py` | `CostFunction`: wraps any scipy distribution of multipliers (conditioned on ≥ 1); monotone `multiplier(severity)` / `severity(multiplier)`, no states. |
-| `disaster_model.py` | `DisasterModel` interface only (cost multipliers — all `Agent`/`Stelllar` see) |
-| `discrete_model.py` | `DiscreteStateModel` (priors over states, equal severity bands per damaged state, multiplier cache, states ↔ multipliers) and `MRFModel` (Gibbs-sampled centered autologistic MRF) |
+| `disaster_model.py` | `DisasterModel` interface only (cost multipliers — all `Agent`/`Stellar` see) |
+| `discrete_model.py` | `DiscreteStateModel` (priors over states, equal severity bands per damaged state, multiplier cache, states ↔ multipliers) and `MRFModel` (centered autologistic MRF, vectorised colour-class Gibbs) |
 | `edges.py` | `canonical(u, v)` edge orientation, `canonical_line_graph(graph)` |
-| `message.py` | Inter-agent `Message` with `Update`/`Heartbeat` payloads, `ALL` broadcast target |
-| `scenario_generator.py` | `Agent` (twin model, knowledge base, routing) and `Stelllar` simulator — **incomplete** |
-| `main.py` | Demo: 40×40 grid, random Dirichlet priors, sample one disaster, plot per state |
+| `message.py` | Inter-agent `Message` with `FullKnowledge`/`PartialKnowledge`/`Heartbeat` payloads, `ALL` broadcast target |
+| `channel.py` | Pluggable `Channel` protocol; `BroadcastChannel` (lossless, next tick) |
+| `scenario_generator.py` | `Agent` (twin model, knowledge, observation, replanning) and `Stellar` fixed-tick simulator → `RunResult` |
+| `main.py` | Demos: 40×40 disaster plot per state; 40×40 three-agent corner-to-corner simulation with perturbed twin priors |
 
 ## Conventions
 - New shared types go in `typedefs.py` as PEP 695 `type X = ...` (or `NewType` for dicts that need a distinct name).
