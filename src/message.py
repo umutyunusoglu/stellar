@@ -2,7 +2,8 @@ import enum
 from dataclasses import dataclass
 from typing import Final, Literal
 
-from typedefs import AgentId, Edge, State
+from edges import canonical
+from typedefs import AgentId, Edge
 
 __all__ = ["ALL", "Heartbeat", "Message", "Payload", "Update"]
 
@@ -19,7 +20,11 @@ type MessageTarget = Literal[_ALL.ALL] | frozenset[AgentId]
 @dataclass(frozen=True, slots=True)
 class Update:
     edge: Edge
-    state: State
+    multiplier: float
+
+    def __post_init__(self) -> None:
+        ## Frozen, so bypass __setattr__ to store the canonical orientation.
+        object.__setattr__(self, "edge", canonical(*self.edge))
 
 
 @dataclass(frozen=True, slots=True)

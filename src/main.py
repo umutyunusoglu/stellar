@@ -1,14 +1,18 @@
 import pprint
 import random
 from collections import Counter
+from logging import Logger
 from typing import cast
 
 import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
 import numpy.typing as npt
+from scipy import stats
 
-from disaster_model import MRFModel
+from cost_function import CostFunction
+from discrete_model import MRFModel
+from edges import canonical_line_graph
 from typedefs import (
     DistanceMatrix,
     Edge,
@@ -19,7 +23,7 @@ from typedefs import (
     StateDistribution,
 )
 
-STATE_COLORS = ("#008000", "#f4a300", "#c1272d")
+STATE_COLORS = ("#008000","#FA5CF7", "#f4a300", "#c1272d",)
 N_STATES = len(STATE_COLORS)
 MUTED_COLOR = "#d9d9d9"
 
@@ -106,7 +110,7 @@ def main() -> None:
     ## Nodes of the line graph are the edges of the network. Take the edge
     ## list from here rather than graph.edges: the two orderings need not
     ## agree, and the model keys on this one.
-    line_graph = nx.line_graph(graph)
+    line_graph = canonical_line_graph(graph)
     edges = cast(list[Edge], list(line_graph.nodes))
 
     ## Only distances the coupling can use. All-pairs would be quadratic in
@@ -117,16 +121,25 @@ def main() -> None:
     }
 
     priors = random_priors(edges, np.random.default_rng(SEED))
+    ## Base costs live on the topology; the model only reasons about
+    ## multipliers. A separate seeded Random keeps the model's draws unchanged.
+    cost_rng = random.Random(SEED)
+    for u, v in edges:
+        graph[u][v]["cost"] = cost_rng.uniform(10, 50)
 
     model = MRFModel(
-        distances,
-        priors,
+        distances=distances,
+        prior_probs=priors,
+        ## Upper half of a lognormal(0, 1): median 1, so no damage is multiplier 1.
+        cost_function=CostFunction(stats.lognorm(s=1)),
         temperature=TEMPERATURE,
         beta=BETA,
         rng=random.Random(SEED),
+        multiplier_rng=random.Random(SEED + 1),
     )
 
-    disaster = model.generate_disaster()
+    ## Plotting is per damage state, so ask the discrete layer for states.
+    disaster = model.generate_states()
     pprint.pprint(Counter(disaster.values()))
 
     for state in range(N_STATES):
